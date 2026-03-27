@@ -1,7 +1,7 @@
 {
-  "name": "@viabl/cli",
-  "version": "1.0.0",
-  "description": "CLI for your docs renderer",
+  "name": "viabl",
+  "version": "0.1.0",
+  "description": "Local development CLI for Viabl documentation",
   "main": "dist/index.js",
   "bin": {
     "viabl": "./dist/index.js"
@@ -11,9 +11,26 @@
     "dev": "tsc --watch",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": [],
-  "author": "jalang'O",
-  "license": "ISC",
+  "keywords": [
+    "docs",
+    "documentation",
+    "viabl",
+    "cli",
+    "mdx"
+  ],
+  "author": "Oj-washingtone",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Oj-washingtone/viabl-cli"
+  },
+  "homepage": "https://viabl.dev",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "files": [
+    "dist"
+  ],
   "dependencies": {
     "chalk": "^5.6.2",
     "commander": "^14.0.3",
