@@ -548,10 +548,16 @@ function prompt(question: string): Promise<string> {
       output: process.stdout,
     });
 
-    rl.on("close", () => resolve(""));
+    let answered = false;
+
     rl.question(question, (answer) => {
+      answered = true;
       rl.close();
       resolve(answer.trim());
+    });
+
+    rl.on("close", () => {
+      if (!answered) resolve("");
     });
   });
 }
