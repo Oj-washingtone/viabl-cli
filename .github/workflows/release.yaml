@@ -8,7 +8,7 @@ jobs:
     publish:
         runs-on: ubuntu-latest
         permissions:
-            contents: write # needed for gh release upload
+            contents: write
 
         steps:
             - name: Checkout
@@ -25,6 +25,10 @@ jobs:
 
             - name: Build
               run: npm run build
+
+            - name: Package build output
+              run: tar -czf content-server.tar.gz -C dist .
+              # Change 'dist' to whatever your build output folder is (e.g. build, out, lib)
 
             - name: Publish to npm
               run: npm publish --access public
