@@ -4,7 +4,7 @@
   "description": "Local development CLI for Viabl documentation",
   "main": "dist/index.js",
   "bin": {
-    "viabl": "./dist/index.js"
+    "viabl": "dist/index.js"
   },
   "scripts": {
     "build": "tsc",
@@ -22,7 +22,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Oj-washingtone/viabl-cli"
+    "url": "git+https://github.com/Oj-washingtone/viabl-cli.git"
   },
   "homepage": "https://viabl.dev",
   "engines": {
