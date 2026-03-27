@@ -11,6 +11,7 @@ import {
   readFileSync,
   writeFileSync,
   readdirSync,
+  renameSync,
 } from "fs";
 import { join } from "path";
 import { homedir } from "os";
@@ -20,16 +21,54 @@ import { createServer } from "net";
 import { createInterface } from "readline";
 import { startScript } from "./startScript";
 
-// ─── Constants ────────────────────────────────────────────────────────────────
-
 const RELEASES_REPO = "Oj-washingtone/viabl-releases";
 const HOME_DIR = join(homedir(), ".viabl");
 const RENDERER_DIR = join(HOME_DIR, "renderer");
 const CONTENT_SERVER_DIR = join(HOME_DIR, "content-server");
 const VERSION_FILE = join(HOME_DIR, "version.json");
-const BUILD_DIR = join(process.cwd(), ".viabl");
 
-// ─── Version Helpers ──────────────────────────────────────────────────────────
+let _zlib: typeof import("zlib") | null = null;
+let _tar: typeof import("tar-fs") | null = null;
+
+async function getZlib() {
+  if (!_zlib) _zlib = await import("zlib");
+  return _zlib;
+}
+
+async function getTar() {
+  if (!_tar) _tar = await import("tar-fs");
+  return _tar;
+}
+
+const activeTempDirs = new Set<string>();
+let earlyAbortController: AbortController | null = null;
+let activeSpinner: Ora | null = null;
+
+function registerEarlyShutdown() {
+  earlyAbortController = new AbortController();
+
+  const handler = () => {
+    earlyAbortController?.abort();
+
+    if (activeSpinner) activeSpinner.stop();
+    if (process.stdin.isTTY) process.stdin.setRawMode(false);
+    process.stdin.pause();
+
+    console.log(chalk.dim("\n  Cancelled"));
+
+    for (const dir of activeTempDirs) {
+      try {
+        if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
+      } catch {}
+    }
+
+    process.exit(0);
+  };
+
+  process.once("SIGINT", handler);
+  process.once("SIGTERM", handler);
+  return handler;
+}
 
 interface VersionInfo {
   renderer: string | null;
@@ -54,18 +93,12 @@ function saveVersionInfo(info: Partial<VersionInfo>) {
   writeFileSync(
     VERSION_FILE,
     JSON.stringify(
-      {
-        ...current,
-        ...info,
-        downloadedAt: new Date().toISOString(),
-      },
+      { ...current, ...info, downloadedAt: new Date().toISOString() },
       null,
       2,
     ),
   );
 }
-
-// ─── Port Helpers ─────────────────────────────────────────────────────────────
 
 function isPortInUse(port: number): Promise<boolean> {
   return new Promise((resolve) => {
@@ -75,7 +108,7 @@ function isPortInUse(port: number): Promise<boolean> {
       server.close();
       resolve(false);
     });
-    server.listen(port, "0.0.0.0");
+    server.listen(port, "127.0.0.1");
   });
 }
 
@@ -88,20 +121,57 @@ async function findAvailablePort(startPort: number): Promise<number> {
   return port;
 }
 
-// ─── GitHub Release Helpers ───────────────────────────────────────────────────
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  retries = 3,
+  delayMs = 1500,
+): Promise<T> {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (earlyAbortController?.signal.aborted) throw err;
+      if (attempt === retries) throw err;
+      await new Promise((res) => setTimeout(res, delayMs * attempt));
+    }
+  }
+  throw new Error("unreachable");
+}
+
+// GitHub Release Helpers
 
 async function getLatestAsset(
   assetName: string,
 ): Promise<{ version: string; downloadUrl: string }> {
-  const res = await fetch(
-    `https://api.github.com/repos/${RELEASES_REPO}/releases/latest`,
-    { headers: { Accept: "application/vnd.github.v3+json" } },
-  );
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+
+  let res: Response;
+  try {
+    res = await fetch(
+      `https://api.github.com/repos/${RELEASES_REPO}/releases/latest`,
+      {
+        signal: controller.signal,
+        headers: {
+          Accept: "application/vnd.github.v3+json",
+          "User-Agent": "viabl-cli/0.1.0",
+        },
+      },
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
 
   if (res.status === 404) {
     throw new Error(
       `Repository or release not found: ${RELEASES_REPO}\n` +
         `  Make sure the releases repo is public and has at least one release.`,
+    );
+  }
+
+  if (res.status === 403 || res.status === 429) {
+    throw new Error(
+      `GitHub API rate limit exceeded. Wait a few minutes and try again.`,
     );
   }
 
@@ -128,7 +198,18 @@ async function getLatestAsset(
   return { version: data.tag_name, downloadUrl: asset.browser_download_url };
 }
 
-// ─── Download + Extract ───────────────────────────────────────────────────────
+// Download + Extract
+
+function throttle<T extends (...args: any[]) => void>(fn: T, ms: number): T {
+  let last = 0;
+  return ((...args: any[]) => {
+    const now = Date.now();
+    if (now - last >= ms) {
+      last = now;
+      fn(...args);
+    }
+  }) as T;
+}
 
 async function downloadAndExtract(
   downloadUrl: string,
@@ -136,72 +217,142 @@ async function downloadAndExtract(
   label: string,
   onProgress: (msg: string) => void,
 ): Promise<void> {
+  const tempDir = `${destDir}_tmp_${Date.now()}`;
+  activeTempDirs.add(tempDir);
+
   if (existsSync(destDir)) rmSync(destDir, { recursive: true, force: true });
-  mkdirSync(destDir, { recursive: true });
+  if (existsSync(tempDir)) rmSync(tempDir, { recursive: true, force: true });
 
-  onProgress(`Downloading ${label}...`);
+  mkdirSync(tempDir, { recursive: true });
 
-  const res = await fetch(downloadUrl);
-  if (!res.ok) throw new Error(`Download failed: ${res.statusText}`);
-  if (!res.body) throw new Error("Response body is empty");
+  const signal = earlyAbortController?.signal;
+  const throttledProgress = throttle(onProgress, 100);
 
-  const totalSize = Number(res.headers.get("content-length") ?? 0);
-  let downloaded = 0;
+  try {
+    onProgress(`Downloading ${label}...`);
 
-  const progressStream = new Transform({
-    transform(chunk, _, cb) {
-      downloaded += chunk.length;
-      if (totalSize > 0) {
-        const pct = Math.round((downloaded / totalSize) * 100);
-        const mb = (downloaded / 1024 / 1024).toFixed(1);
-        onProgress(`Downloading ${label}... ${pct}% (${mb} MB)`);
-      }
-      cb(null, chunk);
-    },
-  });
+    const res = await fetch(downloadUrl, {
+      signal,
+      headers: { "User-Agent": "viabl-cli/0.1.0" },
+    });
+    if (!res.ok) throw new Error(`Download failed: ${res.statusText}`);
+    if (!res.body) throw new Error("Response body is empty");
 
-  const gunzip = (await import("zlib")).createGunzip();
-  const tar = await import("tar-fs");
+    const totalSize = Number(res.headers.get("content-length") ?? 0);
+    let downloaded = 0;
 
-  await pipeline(
-    res.body as unknown as NodeJS.ReadableStream,
-    progressStream,
-    gunzip,
-    tar.extract(destDir),
-  );
+    const progressStream = new Transform({
+      transform(chunk, _, cb) {
+        downloaded += chunk.length;
+        if (totalSize > 0) {
+          const pct = Math.round((downloaded / totalSize) * 100);
+          const mb = (downloaded / 1024 / 1024).toFixed(1);
+          throttledProgress(`Downloading ${label}... ${pct}% (${mb} MB)`);
+        }
+        cb(null, chunk);
+      },
+    });
+
+    const zlib = await getZlib();
+    const tar = await getTar();
+    const gunzip = zlib.createGunzip();
+
+    await pipeline(
+      res.body as unknown as NodeJS.ReadableStream,
+      progressStream,
+      gunzip,
+      tar.extract(tempDir),
+      ...(signal ? [{ signal }] : []),
+    );
+
+    try {
+      renameSync(tempDir, destDir);
+    } catch {
+      const { cpSync } = await import("fs");
+      cpSync(tempDir, destDir, { recursive: true });
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  } catch (err: any) {
+    if (earlyAbortController?.signal.aborted) {
+      throw new Error("__ABORTED__");
+    }
+    rmSync(tempDir, { recursive: true, force: true });
+    throw err;
+  } finally {
+    activeTempDirs.delete(tempDir);
+  }
 }
 
-// ─── Install content server deps after extraction ─────────────────────────────
+// Install content server deps
 
 async function installContentServerDeps(
   onProgress: (msg: string) => void,
 ): Promise<void> {
   onProgress("Installing content server dependencies...");
+
   await new Promise<void>((resolve, reject) => {
-    const child = spawn("npm", ["ci", "--omit=dev"], {
-      cwd: CONTENT_SERVER_DIR,
-      stdio: "ignore",
+    let child: ChildProcess;
+
+    try {
+      child = spawn("npm", ["ci", "--omit=dev"], {
+        cwd: CONTENT_SERVER_DIR,
+        stdio: ["ignore", "ignore", "pipe"],
+      });
+    } catch (err) {
+      return reject(
+        new Error(
+          `Could not spawn npm — is npm installed and in your PATH?\n  ${err}`,
+        ),
+      );
+    }
+
+    let stderrOutput = "";
+    child.stderr?.on("data", (d: Buffer) => {
+      stderrOutput += d.toString();
     });
+
+    child.on("error", (err) => {
+      reject(
+        new Error(
+          `Could not spawn npm — is npm installed and in your PATH?\n  ${err.message}`,
+        ),
+      );
+    });
+
     child.on("exit", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`npm ci failed with code ${code}`));
+      if (code === 0) {
+        resolve();
+      } else {
+        const detail = stderrOutput.trim()
+          ? `\n  ${stderrOutput.trim().split("\n").slice(0, 5).join("\n  ")}`
+          : "";
+        reject(new Error(`npm ci failed with exit code ${code}${detail}`));
+      }
     });
   });
 }
 
-// ─── Wait for content server to be ready ─────────────────────────────────────
-
-function waitForContentServer(port: number, timeoutMs = 10000): Promise<void> {
+function waitForContentServer(port: number, timeoutMs = 20000): Promise<void> {
   return new Promise((resolve, reject) => {
     const start = Date.now();
+
+    let fetchAbort: AbortController | null = null;
+
     const interval = setInterval(async () => {
+      fetchAbort = new AbortController();
+      const fetchTimeout = setTimeout(() => fetchAbort?.abort(), 2000);
+
       try {
-        const res = await fetch(`http://localhost:${port}/health`);
+        const res = await fetch(`http://localhost:${port}/health`, {
+          signal: fetchAbort.signal,
+        });
+        clearTimeout(fetchTimeout);
         if (res.ok) {
           clearInterval(interval);
           resolve();
         }
       } catch {
+        clearTimeout(fetchTimeout);
         if (Date.now() - start > timeoutMs) {
           clearInterval(interval);
           reject(new Error("Content server did not start in time"));
@@ -211,26 +362,25 @@ function waitForContentServer(port: number, timeoutMs = 10000): Promise<void> {
   });
 }
 
-// ─── Ensure renderer is installed / up to date ───────────────────────────────
-
 async function ensureRenderer(spinner: Ora): Promise<void> {
+  activeSpinner = spinner;
   const { renderer: installedVersion } = getVersionInfo();
 
   spinner.text = "Checking renderer...";
-  const { version, downloadUrl } = await getLatestAsset(
-    "renderer-standalone.tar.gz",
+
+  const { version, downloadUrl } = await withRetry(() =>
+    getLatestAsset("renderer-standalone.tar.gz"),
   );
 
   if (installedVersion === version && existsSync(RENDERER_DIR)) {
     spinner.succeed(chalk.dim(`Renderer ${version} ready`));
+    activeSpinner = null;
     return;
   }
 
-  const action = installedVersion
+  spinner.text = installedVersion
     ? `Updating renderer ${installedVersion} → ${version}...`
     : `Installing renderer ${version}...`;
-
-  spinner.text = action;
 
   await downloadAndExtract(downloadUrl, RENDERER_DIR, "renderer", (msg) => {
     spinner.text = msg;
@@ -238,28 +388,28 @@ async function ensureRenderer(spinner: Ora): Promise<void> {
 
   saveVersionInfo({ renderer: version });
   spinner.succeed(chalk.dim(`Renderer ${version} installed`));
+  activeSpinner = null;
 }
 
-// ─── Ensure content server is installed / up to date ─────────────────────────
-
 async function ensureContentServer(spinner: Ora): Promise<void> {
+  activeSpinner = spinner;
   const { contentServer: installedVersion } = getVersionInfo();
 
   spinner.text = "Checking content server...";
-  const { version, downloadUrl } = await getLatestAsset(
-    "content-server.tar.gz",
+
+  const { version, downloadUrl } = await withRetry(() =>
+    getLatestAsset("content-server.tar.gz"),
   );
 
   if (installedVersion === version && existsSync(CONTENT_SERVER_DIR)) {
     spinner.succeed(chalk.dim(`Content server ${version} ready`));
+    activeSpinner = null;
     return;
   }
 
-  const action = installedVersion
+  spinner.text = installedVersion
     ? `Updating content server ${installedVersion} → ${version}...`
     : `Installing content server ${version}...`;
-
-  spinner.text = action;
 
   await downloadAndExtract(
     downloadUrl,
@@ -276,9 +426,10 @@ async function ensureContentServer(spinner: Ora): Promise<void> {
 
   saveVersionInfo({ contentServer: version });
   spinner.succeed(chalk.dim(`Content server ${version} installed`));
+  activeSpinner = null;
 }
 
-// ─── Init Helpers ─────────────────────────────────────────────────────────────
+// Init
 
 const STARTER_REPO = "Oj-washingtone/viabl-starter";
 
@@ -288,63 +439,75 @@ async function downloadStarter(
 ): Promise<void> {
   onProgress("Fetching starter template...");
 
-  // Get the tarball URL for the main branch
   const tarUrl = `https://api.github.com/repos/${STARTER_REPO}/tarball/main`;
+  const signal = earlyAbortController?.signal;
+  const throttledProgress = throttle(onProgress, 100);
 
-  let res: Response;
+  // Track destDir for cleanup on abort
+  activeTempDirs.add(destDir);
+
   try {
-    res = await fetch(tarUrl, {
+    const res = await fetch(tarUrl, {
       redirect: "follow",
-      headers: { Accept: "application/vnd.github.v3+json" },
+      signal,
+      headers: {
+        Accept: "application/vnd.github.v3+json",
+        "User-Agent": "viabl-cli/0.1.0",
+      },
     });
-  } catch (err) {
-    throw new Error(`Network error downloading starter: ${String(err)}`);
-  }
 
-  if (!res.ok)
-    throw new Error(
-      `Failed to download starter: ${res.status} ${res.statusText}`,
+    if (!res.ok)
+      throw new Error(
+        `Failed to download starter: ${res.status} ${res.statusText}`,
+      );
+    if (!res.body) throw new Error("Response body is empty");
+
+    const totalSize = Number(res.headers.get("content-length") ?? 0);
+    let downloaded = 0;
+
+    const progressStream = new Transform({
+      transform(chunk, _, cb) {
+        downloaded += chunk.length;
+        if (totalSize > 0) {
+          const pct = Math.round((downloaded / totalSize) * 100);
+          throttledProgress(`Downloading starter... ${pct}%`);
+        }
+        cb(null, chunk);
+      },
+    });
+
+    const zlib = await getZlib();
+    const tar = await getTar();
+    const gunzip = zlib.createGunzip();
+
+    const strip = tar.extract(destDir, {
+      map: (header) => {
+        header.name = header.name.split("/").slice(1).join("/");
+        return header;
+      },
+    });
+
+    await pipeline(
+      res.body as unknown as NodeJS.ReadableStream,
+      progressStream,
+      gunzip,
+      strip,
+      ...(signal ? [{ signal }] : []),
     );
-  if (!res.body) throw new Error("Response body is empty");
-
-  const totalSize = Number(res.headers.get("content-length") ?? 0);
-  let downloaded = 0;
-
-  const progressStream = new Transform({
-    transform(chunk, _, cb) {
-      downloaded += chunk.length;
-      if (totalSize > 0) {
-        const pct = Math.round((downloaded / totalSize) * 100);
-        onProgress(`Downloading starter... ${pct}%`);
-      }
-      cb(null, chunk);
-    },
-  });
-
-  const gunzip = (await import("zlib")).createGunzip();
-  const tar = await import("tar-fs");
-
-  // GitHub tarballs extract into a folder like "Oj-washingtone-viabl-starter-abc1234/"
-  // We need to strip that top-level folder and extract directly into destDir
-  const strip = tar.extract(destDir, {
-    map: (header) => {
-      // Strip the first path component (the auto-generated folder name)
-      header.name = header.name.split("/").slice(1).join("/");
-      return header;
-    },
-  });
-
-  await pipeline(
-    res.body as unknown as NodeJS.ReadableStream,
-    progressStream,
-    gunzip,
-    strip,
-  );
+  } catch (err: any) {
+    if (earlyAbortController?.signal.aborted) {
+      throw new Error("__ABORTED__");
+    }
+    throw err;
+  } finally {
+    activeTempDirs.delete(destDir);
+  }
 }
 
 async function gitInit(projectDir: string): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const child = spawn("git", ["init"], { cwd: projectDir, stdio: "ignore" });
+    child.on("error", () => reject(new Error("git not found")));
     child.on("exit", (code) =>
       code === 0 ? resolve() : reject(new Error("git init failed")),
     );
@@ -357,6 +520,7 @@ async function gitCommit(projectDir: string, message: string): Promise<void> {
       cwd: projectDir,
       stdio: "ignore",
     });
+    add.on("error", () => reject(new Error("git not found")));
     add.on("exit", (code) => {
       if (code !== 0) return reject(new Error("git add failed"));
       const commit = spawn("git", ["commit", "-m", message], {
@@ -383,29 +547,67 @@ function prompt(question: string): Promise<string> {
       input: process.stdin,
       output: process.stdout,
     });
+
+    let answered = false;
+
     rl.question(question, (answer) => {
+      answered = true;
       rl.close();
       resolve(answer.trim());
+    });
+
+    rl.on("close", () => {
+      if (!answered) resolve("");
     });
   });
 }
 
-// ─── Program ──────────────────────────────────────────────────────────────────
+async function runEnsureSteps(commands: {
+  renderer: boolean;
+  contentServer: boolean;
+}): Promise<boolean> {
+  if (commands.renderer) {
+    const spinner = ora("Checking renderer...").start();
+    try {
+      await ensureRenderer(spinner);
+    } catch (err: any) {
+      if (err?.message === "__ABORTED__") return false;
+      spinner.fail(chalk.red("Failed to install renderer"));
+      console.error(err instanceof Error ? chalk.dim(err.message) : err);
+      return false;
+    }
+  }
+
+  if (commands.contentServer) {
+    const spinner = ora("Checking content server...").start();
+    try {
+      await ensureContentServer(spinner);
+    } catch (err: any) {
+      if (err?.message === "__ABORTED__") return false;
+      spinner.fail(chalk.red("Failed to install content server"));
+      console.error(err instanceof Error ? chalk.dim(err.message) : err);
+      return false;
+    }
+  }
+
+  return true;
+}
 
 program
   .name("viabl")
   .description("Viabl documentation renderer CLI")
   .version("0.1.0");
 
-// ─── Init Command ─────────────────────────────────────────────────────────────
+// Init Command
 
 program
   .command("init [project-name]")
   .description("Create a new Viabl documentation project")
   .action(async (projectName?: string) => {
-    console.log(chalk.bold("\n📖  Create a new Viabl project\n"));
+    registerEarlyShutdown();
 
-    // ── Get project name ──────────────────────────────────────────────────
+    console.log(chalk.bold("\nCreate a new Viabl project\n"));
+
     if (!projectName) {
       projectName = await prompt(
         chalk.white("  What is your project named? ") + chalk.dim("(my-docs) "),
@@ -413,7 +615,6 @@ program
       if (!projectName) projectName = "my-docs";
     }
 
-    // Sanitize — lowercase, hyphens only
     projectName = projectName
       .toLowerCase()
       .replace(/\s+/g, "-")
@@ -421,7 +622,6 @@ program
 
     const projectDir = join(process.cwd(), projectName);
 
-    // ── Check if folder already exists ───────────────────────────────────
     if (existsSync(projectDir)) {
       console.error(chalk.red(`\nFolder '${projectName}' already exists.\n`));
       process.exit(1);
@@ -429,21 +629,25 @@ program
 
     mkdirSync(projectDir, { recursive: true });
 
-    // ── Download starter ──────────────────────────────────────────────────
     const spinner = ora("Fetching starter template...").start();
+    activeSpinner = spinner;
+
     try {
       await downloadStarter(projectDir, (msg) => {
         spinner.text = msg;
       });
       spinner.succeed(chalk.dim("Starter template downloaded"));
-    } catch (err) {
+    } catch (err: any) {
       spinner.fail(chalk.red("Failed to download starter template"));
-      console.error(err instanceof Error ? chalk.dim(err.message) : err);
+      if (err?.message !== "__ABORTED__") {
+        console.error(err instanceof Error ? chalk.dim(err.message) : err);
+      }
       rmSync(projectDir, { recursive: true, force: true });
       process.exit(1);
+    } finally {
+      activeSpinner = null;
     }
 
-    // ── Git init + initial commit ─────────────────────────────────────────
     const gitSpinner = ora("Initialising git repository...").start();
     try {
       await gitInit(projectDir);
@@ -453,7 +657,6 @@ program
       gitSpinner.fail(chalk.dim("Git init skipped — git not found"));
     }
 
-    // ── Done ──────────────────────────────────────────────────────────────
     console.log(chalk.green(`\n✔  Created ${projectName}\n`));
     console.log(chalk.white("  Next steps:\n"));
     console.log(chalk.dim(`    cd ${projectName}`));
@@ -470,7 +673,7 @@ program
     );
   });
 
-// ─── Dev Command ─────────────────────────────────────────────────────────────
+// Dev Command
 
 program
   .command("dev")
@@ -478,8 +681,8 @@ program
   .option("-p, --port <port>", "Port to run on", "7777")
   .action(async (options) => {
     const userDir = process.cwd();
+    const earlyShutdownHandler = registerEarlyShutdown();
 
-    // Validate docs.json exists
     if (!existsSync(join(userDir, "docs.json"))) {
       console.error(chalk.red("\nNo docs.json found in current directory"));
       console.error(
@@ -488,7 +691,6 @@ program
       process.exit(1);
     }
 
-    // Find available ports
     const requestedPort = parseInt(options.port, 10);
     const rendererPort = await findAvailablePort(requestedPort);
     const contentPort = await findAvailablePort(rendererPort + 1);
@@ -501,30 +703,17 @@ program
       );
     }
 
-    console.log(chalk.bold("\n📖  Viabl Dev Server"));
-    console.log(chalk.dim(`📁  ${userDir}`));
-    console.log(chalk.dim(`🌐  http://localhost:${rendererPort}\n`));
+    console.log(chalk.bold("\nViabl Dev Server"));
+    console.log(chalk.dim(`${userDir}`));
+    console.log(chalk.dim(`\n`));
 
-    // ── Ensure renderer and content server are installed ─────────────────
-    const rendererSpinner = ora("Checking renderer...").start();
-    try {
-      await ensureRenderer(rendererSpinner);
-    } catch (err) {
-      rendererSpinner.fail(chalk.red("Failed to install renderer"));
-      console.error(err instanceof Error ? chalk.dim(err.message) : err);
-      process.exit(1);
-    }
+    const ensured = await runEnsureSteps({
+      renderer: true,
+      contentServer: true,
+    });
 
-    const serverSpinner = ora("Checking content server...").start();
-    try {
-      await ensureContentServer(serverSpinner);
-    } catch (err) {
-      serverSpinner.fail(chalk.red("Failed to install content server"));
-      console.error(err instanceof Error ? chalk.dim(err.message) : err);
-      process.exit(1);
-    }
+    if (!ensured) process.exit(1);
 
-    // ── Validate required files ───────────────────────────────────────────
     const serverJs = join(RENDERER_DIR, "server.js");
     const contentServerJs = join(CONTENT_SERVER_DIR, "dist", "index.js");
 
@@ -542,29 +731,44 @@ program
       process.exit(1);
     }
 
-    // ── Start content server ──────────────────────────────────────────────
+    // Hand off from early shutdown to full server shutdown
+    process.removeListener("SIGINT", earlyShutdownHandler);
+    process.removeListener("SIGTERM", earlyShutdownHandler);
+
     const contentSpinner = ora("Starting content server...").start();
 
-    const contentChild: ChildProcess = spawn("node", [contentServerJs], {
-      env: {
-        ...process.env,
-        DOCS_ROOT: userDir,
-        CONTENT_PORT: String(contentPort),
-      },
-      stdio: ["ignore", "pipe", "pipe"],
+    let contentChild: ChildProcess;
+    try {
+      contentChild = spawn("node", [contentServerJs], {
+        env: {
+          ...process.env,
+          DOCS_ROOT: userDir,
+          CONTENT_PORT: String(contentPort),
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (err) {
+      contentSpinner.fail(
+        chalk.red(
+          "Could not start content server — is node installed and in your PATH?",
+        ),
+      );
+      process.exit(1);
+    }
+
+    contentChild!.on("error", (err) => {
+      console.error(
+        chalk.red(
+          `\nContent server spawn error: ${err.message}\n  Is node installed and in your PATH?`,
+        ),
+      );
     });
 
-    contentChild.stderr?.on("data", (data: Buffer) => {
+    contentChild!.stderr?.on("data", (data: Buffer) => {
       const text = data.toString();
       if (text.includes("Error") || text.includes("error")) {
         console.error(chalk.red(text));
       }
-    });
-
-    contentChild.on("exit", (code) => {
-      // if (code !== 0) {
-      //   console.error(chalk.red(`\nContent server exited with code ${code}`));
-      // }
     });
 
     try {
@@ -574,27 +778,46 @@ program
       );
     } catch {
       contentSpinner.fail(chalk.red("Content server failed to start"));
-      contentChild.kill();
+      contentChild!.kill();
       process.exit(1);
     }
 
-    // ── Start renderer ────────────────────────────────────────────────────
+    // Start renderer
     const startSpinner = ora("Starting renderer...").start();
     let rendererReady = false;
 
-    const rendererChild: ChildProcess = spawn("node", [serverJs], {
-      env: {
-        ...process.env,
-        DOCS_ROOT: userDir,
-        PORT: String(rendererPort),
-        HOSTNAME: "0.0.0.0",
-        NEXT_PUBLIC_SITE_URL: `http://localhost:${rendererPort}`,
-        CONTENT_SERVER_URL: `http://localhost:${contentPort}`,
-      },
-      stdio: ["inherit", "pipe", "pipe"],
+    let rendererChild: ChildProcess;
+    try {
+      rendererChild = spawn("node", [serverJs], {
+        env: {
+          ...process.env,
+          DOCS_ROOT: userDir,
+          PORT: String(rendererPort),
+          HOSTNAME: "0.0.0.0",
+          NEXT_PUBLIC_SITE_URL: `http://localhost:${rendererPort}`,
+          CONTENT_SERVER_URL: `http://localhost:${contentPort}`,
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (err) {
+      startSpinner.fail(
+        chalk.red(
+          "Could not start renderer — is node installed and in your PATH?",
+        ),
+      );
+      contentChild!.kill();
+      process.exit(1);
+    }
+
+    rendererChild!.on("error", (err) => {
+      console.error(
+        chalk.red(
+          `\nRenderer spawn error: ${err.message}\n  Is node installed and in your PATH?`,
+        ),
+      );
     });
 
-    rendererChild.stdout?.on("data", (data: Buffer) => {
+    rendererChild!.stdout?.on("data", (data: Buffer) => {
       const text = data.toString();
       if (
         !rendererReady &&
@@ -615,7 +838,7 @@ program
       }
     });
 
-    rendererChild.stderr?.on("data", (data: Buffer) => {
+    rendererChild!.stderr?.on("data", (data: Buffer) => {
       const text = data.toString();
       const skip = [
         "ExperimentalWarning",
@@ -637,42 +860,43 @@ program
 
     let isShuttingDown = false;
 
-    rendererChild.on("exit", (code) => {
+    rendererChild!.on("exit", (code) => {
       if (isShuttingDown) return;
-      contentChild.kill();
+      contentChild!.kill();
       process.exit(code ?? 0);
     });
 
-    // ── Graceful shutdown ─────────────────────────────────────────────────
     const shutdown = () => {
+      if (isShuttingDown) return;
       isShuttingDown = true;
+
       const spinner = ora("Stopping servers...").start();
 
-      rendererChild.stderr?.removeAllListeners("data");
-      rendererChild.stdout?.removeAllListeners("data");
+      rendererChild!.stderr?.removeAllListeners("data");
+      rendererChild!.stdout?.removeAllListeners("data");
 
-      rendererChild.kill("SIGTERM");
+      rendererChild!.kill("SIGTERM");
 
-      rendererChild.once("exit", () => {
-        contentChild.kill("SIGTERM");
+      rendererChild!.once("exit", () => {
+        contentChild!.kill("SIGTERM");
 
         const done = () => {
           spinner.succeed(chalk.dim("Servers stopped"));
           setTimeout(() => process.exit(0), 100);
         };
 
-        contentChild.once("exit", done);
+        contentChild!.once("exit", done);
 
         setTimeout(() => {
-          contentChild.kill("SIGKILL");
+          contentChild!.kill("SIGKILL");
           done();
         }, 3000).unref();
       });
 
       // Safety net
       setTimeout(() => {
-        rendererChild.kill("SIGKILL");
-        contentChild.kill("SIGKILL");
+        rendererChild!.kill("SIGKILL");
+        contentChild!.kill("SIGKILL");
         spinner.succeed(chalk.dim("Servers stopped"));
         setTimeout(() => process.exit(0), 100);
       }, 5000).unref();
@@ -682,41 +906,42 @@ program
     process.on("SIGTERM", shutdown);
   });
 
-// ─── Update Command ───────────────────────────────────────────────────────────
+// Update Command
 
 program
   .command("update")
   .description("Update renderer and content server to latest versions")
   .action(async () => {
-    console.log(chalk.bold("\n🔄  Checking for updates...\n"));
+    registerEarlyShutdown();
 
-    // ── Renderer ─────────────────────────────────────────────────────────
-    const rendererSpinner = ora("Checking renderer...").start();
-    try {
-      await ensureRenderer(rendererSpinner);
-    } catch (err) {
-      rendererSpinner.fail(chalk.red("Failed to update renderer"));
-      console.error(err instanceof Error ? chalk.dim(err.message) : err);
-    }
+    console.log(chalk.bold("\nChecking for updates...\n"));
 
-    // ── Content server ────────────────────────────────────────────────────
-    const serverSpinner = ora("Checking content server...").start();
-    try {
-      await ensureContentServer(serverSpinner);
-    } catch (err) {
-      serverSpinner.fail(chalk.red("Failed to update content server"));
-      console.error(err instanceof Error ? chalk.dim(err.message) : err);
-    }
+    await runEnsureSteps({ renderer: true, contentServer: true });
 
     console.log(chalk.dim("\nDone.\n"));
   });
 
-// ─── Clear Cache Command ──────────────────────────────────────────────────────
+// Clear Cache Command
 
 program
   .command("clear-cache")
   .description("Remove all cached files — will re-download on next run")
-  .action(async () => {
+  .option("-f, --force", "Skip confirmation prompt")
+  .action(async (options) => {
+    if (!options.force) {
+      const answer = await prompt(
+        chalk.yellow(
+          "  This will remove the cached renderer and content server.\n" +
+            "  They will be re-downloaded on next run.\n\n" +
+            "  Continue? (y/N) ",
+        ),
+      );
+      if (answer.toLowerCase() !== "y") {
+        console.log(chalk.dim("\n  Cancelled\n"));
+        process.exit(0);
+      }
+    }
+
     const spinner = ora("Clearing cache...").start();
     try {
       if (existsSync(HOME_DIR)) {
@@ -732,7 +957,7 @@ program
     }
   });
 
-// ─── Version Info Command ─────────────────────────────────────────────────────
+// Version Info Command
 
 program
   .command("version-info")
@@ -749,7 +974,7 @@ program
       return;
     }
 
-    console.log(chalk.bold("\n📦  Installed versions:"));
+    console.log(chalk.bold("\n📦 Installed versions:"));
     console.log(
       `  Renderer:       ${info.renderer ? chalk.green(info.renderer) : chalk.dim("not installed")}`,
     );
@@ -766,7 +991,7 @@ program
     console.log();
   });
 
-// ─── Build Command ────────────────────────────────────────────────────────────
+// Build Command
 
 program
   .command("build")
@@ -775,7 +1000,8 @@ program
     const userDir = process.cwd();
     const BUILD_DIR = join(userDir, ".viabl");
 
-    // Validate docs.json exists
+    registerEarlyShutdown();
+
     if (!existsSync(join(userDir, "docs.json"))) {
       console.error(chalk.red("\n  No docs.json found in current directory"));
       console.error(
@@ -786,55 +1012,35 @@ program
 
     console.log(chalk.bold("\n📦  Viabl Build\n"));
 
-    // ── Ensure renderer and content server are installed ──────────────────
-    const rendererSpinner = ora("Checking renderer...").start();
-    try {
-      await ensureRenderer(rendererSpinner);
-    } catch (err) {
-      rendererSpinner.fail(chalk.red("Failed to install renderer"));
-      console.error(err instanceof Error ? chalk.dim(err.message) : err);
-      process.exit(1);
-    }
+    const ensured = await runEnsureSteps({
+      renderer: true,
+      contentServer: true,
+    });
+    if (!ensured) process.exit(1);
 
-    const serverSpinner = ora("Checking content server...").start();
-    try {
-      await ensureContentServer(serverSpinner);
-    } catch (err) {
-      serverSpinner.fail(chalk.red("Failed to install content server"));
-      console.error(err instanceof Error ? chalk.dim(err.message) : err);
-      process.exit(1);
-    }
-
-    // ── Assemble build output ─────────────────────────────────────────────
     const buildSpinner = ora("Assembling build output...").start();
     try {
-      // Clean and recreate build dir
       if (existsSync(BUILD_DIR))
         rmSync(BUILD_DIR, { recursive: true, force: true });
       mkdirSync(BUILD_DIR, { recursive: true });
 
-      // Copy renderer
-      const { cpSync } = await import("fs");
-      cpSync(RENDERER_DIR, join(BUILD_DIR, "renderer"), { recursive: true });
+      const { cp } = await import("fs/promises");
 
-      // Copy content server
-      cpSync(CONTENT_SERVER_DIR, join(BUILD_DIR, "content-server"), {
+      await cp(RENDERER_DIR, join(BUILD_DIR, "renderer"), { recursive: true });
+      await cp(CONTENT_SERVER_DIR, join(BUILD_DIR, "content-server"), {
         recursive: true,
       });
 
-      // Copy user's docs — copy individual items to avoid src/dest conflict
-      // const { readdirSync } = await import("fs");
       const excluded = new Set([".git", "node_modules", ".viabl"]);
       const docsDir = join(BUILD_DIR, "docs");
       mkdirSync(docsDir, { recursive: true });
 
       for (const item of readdirSync(userDir)) {
         if (excluded.has(item)) continue;
-        cpSync(join(userDir, item), join(docsDir, item), { recursive: true });
+        await cp(join(userDir, item), join(docsDir, item), { recursive: true });
       }
 
       writeFileSync(join(BUILD_DIR, "start.js"), startScript, { mode: 0o755 });
-
       buildSpinner.succeed(chalk.dim("Build output ready"));
     } catch (err) {
       buildSpinner.fail(chalk.red("Build failed"));
@@ -842,7 +1048,6 @@ program
       process.exit(1);
     }
 
-    // ── Done ──────────────────────────────────────────────────────────────
     console.log(chalk.green("\n✔  Build complete\n"));
     console.log(chalk.white("  Output: ") + chalk.dim(".viabl/\n"));
     console.log(chalk.white("  To run locally:"));
@@ -850,7 +1055,7 @@ program
     console.log(chalk.dim("    PORT=<YOUR_PORT> node .viabl/start.js\n"));
   });
 
-// ─── Start Command ────────────────────────────────────────────────────────────
+// Start Command
 
 program
   .command("start")
@@ -871,17 +1076,36 @@ program
       process.exit(1);
     }
 
-    const child = spawn("node", [startJs], {
-      env: { ...process.env, PORT: options.port },
-      stdio: "inherit",
+    let child: ChildProcess;
+    try {
+      child = spawn("node", [startJs], {
+        env: { ...process.env, PORT: options.port },
+        stdio: "inherit",
+      });
+    } catch (err) {
+      console.error(
+        chalk.red(
+          "\nCould not start server — is node installed and in your PATH?\n",
+        ),
+      );
+      process.exit(1);
+    }
+
+    child!.on("error", (err) => {
+      console.error(
+        chalk.red(
+          `\nSpawn error: ${err.message}\n  Is node installed and in your PATH?`,
+        ),
+      );
     });
 
-    child.on("exit", (code) => process.exit(code ?? 0));
+    child!.on("exit", (code) => process.exit(code ?? 0));
 
+    let isShuttingDown = false;
     const shutdown = () => {
-      child.stderr?.removeAllListeners("data");
-      child.stdout?.removeAllListeners("data");
-      child.kill("SIGTERM");
+      if (isShuttingDown) return;
+      isShuttingDown = true;
+      child!.kill("SIGTERM");
     };
 
     process.on("SIGINT", shutdown);
