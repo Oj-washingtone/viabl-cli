@@ -1,5 +1,5 @@
 {
-  "name": "viabl-cli",
+  "name": "@viablkit/cli",
   "version": "0.1.0",
   "description": "Local development CLI for Viabl documentation",
   "main": "dist/index.js",
