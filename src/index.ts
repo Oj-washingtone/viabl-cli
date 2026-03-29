@@ -20,6 +20,7 @@ import { Transform } from "stream";
 import { createServer } from "net";
 import { createInterface } from "readline";
 import { startScript } from "./startScript";
+const { version } = require("../package.json");
 
 const RELEASES_REPO = "Oj-washingtone/viabl-releases";
 const HOME_DIR = join(homedir(), ".viabl");
@@ -596,7 +597,7 @@ async function runEnsureSteps(commands: {
 program
   .name("viabl")
   .description("Viabl documentation renderer CLI")
-  .version("0.1.0");
+  .version(version);
 
 // Init Command
 
@@ -1026,7 +1027,10 @@ program
 
       const { cp } = await import("fs/promises");
 
-      await cp(RENDERER_DIR, join(BUILD_DIR, "renderer"), { recursive: true });
+      await cp(RENDERER_DIR, join(BUILD_DIR, "renderer"), {
+        recursive: true,
+        dereference: true,
+      });
       await cp(CONTENT_SERVER_DIR, join(BUILD_DIR, "content-server"), {
         recursive: true,
         dereference: true,
