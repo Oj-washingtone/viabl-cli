@@ -1029,6 +1029,7 @@ program
       await cp(RENDERER_DIR, join(BUILD_DIR, "renderer"), { recursive: true });
       await cp(CONTENT_SERVER_DIR, join(BUILD_DIR, "content-server"), {
         recursive: true,
+        dereference: true,
       });
 
       const excluded = new Set([".git", "node_modules", ".viabl"]);
