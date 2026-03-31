@@ -1,0 +1,24 @@
+pre-commit:
+    jobs:
+        - run: pnpm run format-and-check
+          glob:
+              - "*.js"
+              - "*.jsx"
+              - "*.ts"
+              - "*.tsx"
+              - "*.json"
+              - "*.jsonc"
+          stage_fixed: true
+
+commit-msg:
+    commands:
+        lint commit message:
+            run: pnpm dlx commitlint --edit "$1"
+
+post-commit:
+    commands:
+        push tags:
+            run: |
+                if git describe --exact-match --tags HEAD 2>/dev/null; then
+                    git push --follow-tags origin main
+                fi
