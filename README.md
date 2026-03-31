@@ -1,4 +1,4 @@
-# viabl
+# Viabl
 
 A CLI tool for running, building, and deploying Viabl documentation projects.
 
