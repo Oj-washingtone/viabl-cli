@@ -1,0 +1,86 @@
+{
+	"$schema": "https://unpkg.com/release-it/schema/release-it.json",
+	"git": {
+		"tagName": "v${version}",
+		"push": true,
+		"pushRepo": "origin",
+		"requireCleanWorkingDir": true,
+		"requireUpstream": true,
+		"commit": true,
+		"commitMessage": "chore(release): v${version}",
+		"commitArgs": ["--no-verify"],
+		"tag": true
+	},
+	"github": {
+		"release": false
+	},
+	"npm": {
+		"publish": false
+	},
+	"plugins": {
+		"@release-it/conventional-changelog": {
+			"preset": {
+				"name": "conventionalcommits",
+				"types": [
+					{
+						"type": "feat",
+						"section": "✨ Features"
+					},
+					{
+						"type": "fix",
+						"section": "🐛 Bug Fixes"
+					},
+					{
+						"type": "perf",
+						"section": "⚡ Performance"
+					},
+					{
+						"type": "refactor",
+						"section": "♻️ Refactors"
+					},
+					{
+						"type": "docs",
+						"section": "📝 Docs"
+					},
+					{
+						"type": "revert",
+						"section": "⏪ Reverts"
+					},
+					{
+						"type": "chore",
+						"hidden": true
+					},
+					{
+						"type": "style",
+						"hidden": true
+					},
+					{
+						"type": "test",
+						"hidden": true
+					},
+					{
+						"type": "init",
+						"hidden": true
+					},
+					{
+						"type": "build",
+						"hidden": true
+					},
+					{
+						"type": "ci",
+						"hidden": true
+					}
+				]
+			},
+			"infile": "CHANGELOG.md",
+			"ignoreRecommendedBump": false,
+			"strictSemVer": true,
+			"commitUrlFormat": "https://github.com/thecodingmontana/viabl-cli/commit/{{hash}}",
+			"compareUrlFormat": "https://github.com/thecodingmontana/viabl-cli/compare/{{previousTag}}...{{currentTag}}",
+			"issueUrlFormat": "https://github.com/thecodingmontana/viabl-cli/issues/{{id}}"
+		}
+	},
+	"hooks": {
+		"after:release": "echo '✅ Released v${version} successfully!'"
+	}
+}

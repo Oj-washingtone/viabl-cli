@@ -16,7 +16,11 @@
 		"deps:check": "pnpm dlx taze@latest",
 		"deps:major": "pnpm dlx taze@latest major -w",
 		"prepare": "husky",
-		"commit": "git add . && git cz"
+		"commit": "pnpm run format-and-check && git add . && git cz",
+		"release": "release-it",
+		"release:minor": "release-it minor",
+		"release:major": "release-it major",
+		"release:patch": "release-it patch"
 	},
 	"config": {
 		"commitizen": {
@@ -54,11 +58,13 @@
 		"@biomejs/biome": "2.4.10",
 		"@commitlint/cli": "^20.5.0",
 		"@commitlint/config-conventional": "^20.5.0",
+		"@release-it/conventional-changelog": "^10.0.6",
 		"@types/node": "^25.3.5",
 		"@types/tar-fs": "^2.0.4",
 		"cz-git": "^1.12.0",
 		"husky": "^9.1.7",
 		"lefthook": "^2.1.4",
+		"release-it": "^19.2.4",
 		"typescript": "^5.9.3"
 	}
 }
