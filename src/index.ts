@@ -3,7 +3,9 @@
 import { program } from "commander";
 import chalk from "chalk";
 import ora, { type Ora } from "ora";
-import { spawn, ChildProcess } from "child_process";
+import { ChildProcess } from "child_process";
+import spawn from "cross-spawn";
+
 import {
   existsSync,
   mkdirSync,
@@ -284,55 +286,6 @@ async function downloadAndExtract(
   }
 }
 
-// Install content server deps
-
-async function installContentServerDeps(
-  onProgress: (msg: string) => void,
-): Promise<void> {
-  onProgress("Installing content server dependencies...");
-
-  await new Promise<void>((resolve, reject) => {
-    let child: ChildProcess;
-
-    try {
-      child = spawn("npm", ["ci", "--omit=dev"], {
-        cwd: CONTENT_SERVER_DIR,
-        stdio: ["ignore", "ignore", "pipe"],
-      });
-    } catch (err) {
-      return reject(
-        new Error(
-          `Could not spawn npm — is npm installed and in your PATH?\n  ${err}`,
-        ),
-      );
-    }
-
-    let stderrOutput = "";
-    child.stderr?.on("data", (d: Buffer) => {
-      stderrOutput += d.toString();
-    });
-
-    child.on("error", (err) => {
-      reject(
-        new Error(
-          `Could not spawn npm — is npm installed and in your PATH?\n  ${err.message}`,
-        ),
-      );
-    });
-
-    child.on("exit", (code) => {
-      if (code === 0) {
-        resolve();
-      } else {
-        const detail = stderrOutput.trim()
-          ? `\n  ${stderrOutput.trim().split("\n").slice(0, 5).join("\n  ")}`
-          : "";
-        reject(new Error(`npm ci failed with exit code ${code}${detail}`));
-      }
-    });
-  });
-}
-
 function waitForContentServer(port: number, timeoutMs = 20000): Promise<void> {
   return new Promise((resolve, reject) => {
     const start = Date.now();
@@ -420,10 +373,6 @@ async function ensureContentServer(spinner: Ora): Promise<void> {
       spinner.text = msg;
     },
   );
-
-  await installContentServerDeps((msg) => {
-    spinner.text = msg;
-  });
 
   saveVersionInfo({ contentServer: version });
   spinner.succeed(chalk.dim(`Content server ${version} installed`));
@@ -744,6 +693,7 @@ program
         env: {
           ...process.env,
           DOCS_ROOT: userDir,
+          NODE_ENV: "development",
           CONTENT_PORT: String(contentPort),
         },
         stdio: ["ignore", "pipe", "pipe"],
@@ -1084,7 +1034,7 @@ program
     let child: ChildProcess;
     try {
       child = spawn("node", [startJs], {
-        env: { ...process.env, PORT: options.port },
+        env: { ...process.env, PORT: options.port, NODE_ENV: "production" },
         stdio: "inherit",
       });
     } catch (err) {
