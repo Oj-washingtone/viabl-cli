@@ -15,7 +15,7 @@ A CLI tool for running, building, and deploying Viabl documentation projects.
 ## Installation
 
 ```bash
-npm install -g viabl
+npm install -g @viablkit/cli
 ```
 
 ---
