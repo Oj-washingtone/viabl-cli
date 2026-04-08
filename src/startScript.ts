@@ -28,6 +28,7 @@ const rendererChild = spawn("node", [join(RENDERER_DIR, "server.js")], {
     PORT:               String(RENDERER_PORT),
     HOSTNAME:           "0.0.0.0",
     CONTENT_SERVER_URL: "http://localhost:" + CONTENT_PORT,
+    NODE_ENV:           "production",
   },
   stdio: ["inherit", "pipe", "pipe"],
 });
