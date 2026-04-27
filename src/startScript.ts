@@ -1,6 +1,7 @@
 export const startScript = `#!/usr/bin/env node
 const { spawn } = require("child_process");
 const { join } = require("path");
+const { existsSync, readFileSync } = require("fs");
 
 const ROOT          = __dirname;
 const RENDERER_DIR  = join(ROOT, "renderer");
@@ -9,8 +10,22 @@ const DOCS_DIR      = join(ROOT, "docs");
 const RENDERER_PORT = parseInt(process.env.PORT ?? "7777", 10);
 const CONTENT_PORT  = parseInt(process.env.CONTENT_PORT ?? String(RENDERER_PORT + 1), 10);
 
+
+let basePath = "";
+
+
+try {
+  const config = JSON.parse(readFileSync(join(DOCS_DIR, "docs.json"), "utf-8"));
+  basePath = config.basePath ?? "";
+} catch {}
+
+if (basePath && !basePath.startsWith("/")) {
+  basePath = "/" + basePath;
+}
+
+
 console.log("\\nViabl");
-console.log("🌐 http://localhost:" + RENDERER_PORT + "\\n");
+console.log("🌐 http://localhost:" + RENDERER_PORT + basePath + "\\n");
 
 const contentChild = spawn("node", [join(SERVER_DIR, "dist", "index.js")], {
   env: {
@@ -28,6 +43,7 @@ const rendererChild = spawn("node", [join(RENDERER_DIR, "server.js")], {
     PORT:               String(RENDERER_PORT),
     HOSTNAME:           "0.0.0.0",
     CONTENT_SERVER_URL: "http://localhost:" + CONTENT_PORT,
+    NODE_ENV:           "production",
   },
   stdio: ["inherit", "pipe", "pipe"],
 });
