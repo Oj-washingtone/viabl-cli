@@ -6,542 +6,26 @@ import ora, { type Ora } from "ora";
 import { ChildProcess } from "child_process";
 import spawn from "cross-spawn";
 
-import {
-  existsSync,
-  mkdirSync,
-  rmSync,
-  readFileSync,
-  writeFileSync,
-  readdirSync,
-  renameSync,
-} from "fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync, readdirSync } from "fs";
 import { join } from "path";
-import { homedir } from "os";
-import { pipeline } from "stream/promises";
-import { Transform } from "stream";
-import { createServer } from "net";
-import { createInterface } from "readline";
 import { startScript } from "./startScript";
+import { prompt } from "./utils/prompt";
+import { gitInit, gitCommit } from "./utils/gitHelpers";
+
+import { HOME_DIR, RENDERER_DIR, CONTENT_SERVER_DIR } from "./constants";
+import { findAvailablePort } from "./managePorts";
+import { getVersionInfo } from "./version";
+import { registerEarlyShutdown } from "./utils/shutdowns";
+import { waitForServer } from "./server";
+import { runSteps } from "./utils/ensureSteps";
+import { buildRenderer } from "./render";
+import { downloadStarter } from "./assets";
+
 const { version } = require("../package.json");
 
-const RELEASES_REPO = "Oj-washingtone/viabl-releases";
-const HOME_DIR = join(homedir(), ".viabl");
-const RENDERER_DIR = join(HOME_DIR, "renderer");
-const CONTENT_SERVER_DIR = join(HOME_DIR, "content-server");
-const VERSION_FILE = join(HOME_DIR, "version.json");
-
-let _zlib: typeof import("zlib") | null = null;
-let _tar: typeof import("tar-fs") | null = null;
-
-async function getZlib() {
-  if (!_zlib) _zlib = await import("zlib");
-  return _zlib;
-}
-
-async function getTar() {
-  if (!_tar) _tar = await import("tar-fs");
-  return _tar;
-}
-
-const activeTempDirs = new Set<string>();
-let earlyAbortController: AbortController | null = null;
+export const activeTempDirs = new Set<string>();
+export let earlyAbortController: AbortController | null = null;
 let activeSpinner: Ora | null = null;
-
-function registerEarlyShutdown() {
-  earlyAbortController = new AbortController();
-
-  const handler = () => {
-    earlyAbortController?.abort();
-
-    if (activeSpinner) activeSpinner.stop();
-    if (process.stdin.isTTY) process.stdin.setRawMode(false);
-    process.stdin.pause();
-
-    console.log(chalk.dim("\n  Cancelled"));
-
-    for (const dir of activeTempDirs) {
-      try {
-        if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
-      } catch {}
-    }
-
-    process.exit(0);
-  };
-
-  process.once("SIGINT", handler);
-  process.once("SIGTERM", handler);
-  return handler;
-}
-
-interface VersionInfo {
-  renderer: string | null;
-  contentServer: string | null;
-  downloadedAt: string;
-}
-
-function getVersionInfo(): VersionInfo {
-  try {
-    if (!existsSync(VERSION_FILE)) {
-      return { renderer: null, contentServer: null, downloadedAt: "" };
-    }
-    return JSON.parse(readFileSync(VERSION_FILE, "utf-8")) as VersionInfo;
-  } catch {
-    return { renderer: null, contentServer: null, downloadedAt: "" };
-  }
-}
-
-function saveVersionInfo(info: Partial<VersionInfo>) {
-  mkdirSync(HOME_DIR, { recursive: true });
-  const current = getVersionInfo();
-  writeFileSync(
-    VERSION_FILE,
-    JSON.stringify(
-      { ...current, ...info, downloadedAt: new Date().toISOString() },
-      null,
-      2,
-    ),
-  );
-}
-
-function isPortInUse(port: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    const server = createServer();
-    server.once("error", () => resolve(true));
-    server.once("listening", () => {
-      server.close();
-      resolve(false);
-    });
-    server.listen(port, "127.0.0.1");
-  });
-}
-
-async function findAvailablePort(startPort: number): Promise<number> {
-  let port = startPort;
-  while (await isPortInUse(port)) {
-    console.log(chalk.dim(`  Port ${port} in use, trying ${port + 1}...`));
-    port++;
-  }
-  return port;
-}
-
-async function withRetry<T>(
-  fn: () => Promise<T>,
-  retries = 3,
-  delayMs = 1500,
-): Promise<T> {
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      return await fn();
-    } catch (err) {
-      if (earlyAbortController?.signal.aborted) throw err;
-      if (attempt === retries) throw err;
-      await new Promise((res) => setTimeout(res, delayMs * attempt));
-    }
-  }
-  throw new Error("unreachable");
-}
-
-// GitHub Release Helpers
-
-async function getLatestAsset(
-  assetName: string,
-): Promise<{ version: string; downloadUrl: string }> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15_000);
-
-  let res: Response;
-  try {
-    res = await fetch(
-      `https://api.github.com/repos/${RELEASES_REPO}/releases/latest`,
-      {
-        signal: controller.signal,
-        headers: {
-          Accept: "application/vnd.github.v3+json",
-          "User-Agent": "viabl-cli/0.1.0",
-        },
-      },
-    );
-  } finally {
-    clearTimeout(timeout);
-  }
-
-  if (res.status === 404) {
-    throw new Error(
-      `Repository or release not found: ${RELEASES_REPO}\n` +
-        `  Make sure the releases repo is public and has at least one release.`,
-    );
-  }
-
-  if (res.status === 403 || res.status === 429) {
-    throw new Error(
-      `GitHub API rate limit exceeded. Wait a few minutes and try again.`,
-    );
-  }
-
-  if (!res.ok) {
-    throw new Error(
-      `Could not fetch release info from GitHub: ${res.statusText}`,
-    );
-  }
-
-  const data = (await res.json()) as {
-    tag_name: string;
-    assets: Array<{ name: string; browser_download_url: string }>;
-  };
-
-  const asset = data.assets.find((a) => a.name === assetName);
-
-  if (!asset) {
-    throw new Error(
-      `${assetName} not found in release ${data.tag_name}.\n` +
-        `  Make sure the GitHub Actions release workflow ran successfully.`,
-    );
-  }
-
-  return { version: data.tag_name, downloadUrl: asset.browser_download_url };
-}
-
-// Download + Extract
-
-function throttle<T extends (...args: any[]) => void>(fn: T, ms: number): T {
-  let last = 0;
-  return ((...args: any[]) => {
-    const now = Date.now();
-    if (now - last >= ms) {
-      last = now;
-      fn(...args);
-    }
-  }) as T;
-}
-
-async function downloadAndExtract(
-  downloadUrl: string,
-  destDir: string,
-  label: string,
-  onProgress: (msg: string) => void,
-): Promise<void> {
-  const tempDir = `${destDir}_tmp_${Date.now()}`;
-  activeTempDirs.add(tempDir);
-
-  if (existsSync(destDir)) rmSync(destDir, { recursive: true, force: true });
-  if (existsSync(tempDir)) rmSync(tempDir, { recursive: true, force: true });
-
-  mkdirSync(tempDir, { recursive: true });
-
-  const signal = earlyAbortController?.signal;
-  const throttledProgress = throttle(onProgress, 100);
-
-  try {
-    onProgress(`Downloading ${label}...`);
-
-    const res = await fetch(downloadUrl, {
-      signal,
-      headers: { "User-Agent": "viabl-cli/0.1.0" },
-    });
-    if (!res.ok) throw new Error(`Download failed: ${res.statusText}`);
-    if (!res.body) throw new Error("Response body is empty");
-
-    const totalSize = Number(res.headers.get("content-length") ?? 0);
-    let downloaded = 0;
-
-    const progressStream = new Transform({
-      transform(chunk, _, cb) {
-        downloaded += chunk.length;
-        if (totalSize > 0) {
-          const pct = Math.round((downloaded / totalSize) * 100);
-          const mb = (downloaded / 1024 / 1024).toFixed(1);
-          throttledProgress(`Downloading ${label}... ${pct}% (${mb} MB)`);
-        }
-        cb(null, chunk);
-      },
-    });
-
-    const zlib = await getZlib();
-    const tar = await getTar();
-    const gunzip = zlib.createGunzip();
-
-    await pipeline(
-      res.body as unknown as NodeJS.ReadableStream,
-      progressStream,
-      gunzip,
-      tar.extract(tempDir),
-      ...(signal ? [{ signal }] : []),
-    );
-
-    try {
-      renameSync(tempDir, destDir);
-    } catch {
-      const { cpSync } = await import("fs");
-      cpSync(tempDir, destDir, { recursive: true });
-      rmSync(tempDir, { recursive: true, force: true });
-    }
-  } catch (err: any) {
-    if (earlyAbortController?.signal.aborted) {
-      throw new Error("__ABORTED__");
-    }
-    rmSync(tempDir, { recursive: true, force: true });
-    throw err;
-  } finally {
-    activeTempDirs.delete(tempDir);
-  }
-}
-
-function waitForContentServer(port: number, timeoutMs = 20000): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const start = Date.now();
-
-    let fetchAbort: AbortController | null = null;
-
-    const interval = setInterval(async () => {
-      fetchAbort = new AbortController();
-      const fetchTimeout = setTimeout(() => fetchAbort?.abort(), 2000);
-
-      try {
-        const res = await fetch(`http://localhost:${port}/health`, {
-          signal: fetchAbort.signal,
-        });
-        clearTimeout(fetchTimeout);
-        if (res.ok) {
-          clearInterval(interval);
-          resolve();
-        }
-      } catch {
-        clearTimeout(fetchTimeout);
-        if (Date.now() - start > timeoutMs) {
-          clearInterval(interval);
-          reject(new Error("Content server did not start in time"));
-        }
-      }
-    }, 300);
-  });
-}
-
-async function ensureRenderer(spinner: Ora): Promise<void> {
-  activeSpinner = spinner;
-  const { renderer: installedVersion } = getVersionInfo();
-
-  spinner.text = "Checking renderer...";
-
-  const { version, downloadUrl } = await withRetry(() =>
-    getLatestAsset("renderer-standalone.tar.gz"),
-  );
-
-  if (installedVersion === version && existsSync(RENDERER_DIR)) {
-    spinner.succeed(chalk.dim(`Renderer ${version} ready`));
-    activeSpinner = null;
-    return;
-  }
-
-  spinner.text = installedVersion
-    ? `Updating renderer ${installedVersion} → ${version}...`
-    : `Installing renderer ${version}...`;
-
-  await downloadAndExtract(downloadUrl, RENDERER_DIR, "renderer", (msg) => {
-    spinner.text = msg;
-  });
-
-  saveVersionInfo({ renderer: version });
-  spinner.succeed(chalk.dim(`Renderer ${version} installed`));
-  activeSpinner = null;
-}
-
-async function ensureContentServer(spinner: Ora): Promise<void> {
-  activeSpinner = spinner;
-  const { contentServer: installedVersion } = getVersionInfo();
-
-  spinner.text = "Checking content server...";
-
-  const { version, downloadUrl } = await withRetry(() =>
-    getLatestAsset("content-server.tar.gz"),
-  );
-
-  if (installedVersion === version && existsSync(CONTENT_SERVER_DIR)) {
-    spinner.succeed(chalk.dim(`Content server ${version} ready`));
-    activeSpinner = null;
-    return;
-  }
-
-  spinner.text = installedVersion
-    ? `Updating content server ${installedVersion} → ${version}...`
-    : `Installing content server ${version}...`;
-
-  await downloadAndExtract(
-    downloadUrl,
-    CONTENT_SERVER_DIR,
-    "content server",
-    (msg) => {
-      spinner.text = msg;
-    },
-  );
-
-  saveVersionInfo({ contentServer: version });
-  spinner.succeed(chalk.dim(`Content server ${version} installed`));
-  activeSpinner = null;
-}
-
-// Init
-
-const STARTER_REPO = "Oj-washingtone/viabl-starter";
-
-async function downloadStarter(
-  destDir: string,
-  onProgress: (msg: string) => void,
-): Promise<void> {
-  onProgress("Fetching starter template...");
-
-  const tarUrl = `https://api.github.com/repos/${STARTER_REPO}/tarball/main`;
-  const signal = earlyAbortController?.signal;
-  const throttledProgress = throttle(onProgress, 100);
-
-  // Track destDir for cleanup on abort
-  activeTempDirs.add(destDir);
-
-  try {
-    const res = await fetch(tarUrl, {
-      redirect: "follow",
-      signal,
-      headers: {
-        Accept: "application/vnd.github.v3+json",
-        "User-Agent": "viabl-cli/0.1.0",
-      },
-    });
-
-    if (!res.ok)
-      throw new Error(
-        `Failed to download starter: ${res.status} ${res.statusText}`,
-      );
-    if (!res.body) throw new Error("Response body is empty");
-
-    const totalSize = Number(res.headers.get("content-length") ?? 0);
-    let downloaded = 0;
-
-    const progressStream = new Transform({
-      transform(chunk, _, cb) {
-        downloaded += chunk.length;
-        if (totalSize > 0) {
-          const pct = Math.round((downloaded / totalSize) * 100);
-          throttledProgress(`Downloading starter... ${pct}%`);
-        }
-        cb(null, chunk);
-      },
-    });
-
-    const zlib = await getZlib();
-    const tar = await getTar();
-    const gunzip = zlib.createGunzip();
-
-    const strip = tar.extract(destDir, {
-      map: (header) => {
-        header.name = header.name.split("/").slice(1).join("/");
-        return header;
-      },
-    });
-
-    await pipeline(
-      res.body as unknown as NodeJS.ReadableStream,
-      progressStream,
-      gunzip,
-      strip,
-      ...(signal ? [{ signal }] : []),
-    );
-  } catch (err: any) {
-    if (earlyAbortController?.signal.aborted) {
-      throw new Error("__ABORTED__");
-    }
-    throw err;
-  } finally {
-    activeTempDirs.delete(destDir);
-  }
-}
-
-async function gitInit(projectDir: string): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
-    const child = spawn("git", ["init"], { cwd: projectDir, stdio: "ignore" });
-    child.on("error", () => reject(new Error("git not found")));
-    child.on("exit", (code) =>
-      code === 0 ? resolve() : reject(new Error("git init failed")),
-    );
-  });
-}
-
-async function gitCommit(projectDir: string, message: string): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
-    const add = spawn("git", ["add", "."], {
-      cwd: projectDir,
-      stdio: "ignore",
-    });
-    add.on("error", () => reject(new Error("git not found")));
-    add.on("exit", (code) => {
-      if (code !== 0) return reject(new Error("git add failed"));
-      const commit = spawn("git", ["commit", "-m", message], {
-        cwd: projectDir,
-        stdio: "ignore",
-        env: {
-          ...process.env,
-          GIT_AUTHOR_NAME: "Viabl",
-          GIT_AUTHOR_EMAIL: "init@viabl.dev",
-          GIT_COMMITTER_NAME: "Viabl",
-          GIT_COMMITTER_EMAIL: "init@viabl.dev",
-        },
-      });
-      commit.on("exit", (c) =>
-        c === 0 ? resolve() : reject(new Error("git commit failed")),
-      );
-    });
-  });
-}
-
-function prompt(question: string): Promise<string> {
-  return new Promise((resolve) => {
-    const rl = createInterface({
-      input: process.stdin,
-      output: process.stdout,
-    });
-
-    let answered = false;
-
-    rl.question(question, (answer) => {
-      answered = true;
-      rl.close();
-      resolve(answer.trim());
-    });
-
-    rl.on("close", () => {
-      if (!answered) resolve("");
-    });
-  });
-}
-
-async function runEnsureSteps(commands: {
-  renderer: boolean;
-  contentServer: boolean;
-}): Promise<boolean> {
-  if (commands.renderer) {
-    const spinner = ora("Checking renderer...").start();
-    try {
-      await ensureRenderer(spinner);
-    } catch (err: any) {
-      if (err?.message === "__ABORTED__") return false;
-      spinner.fail(chalk.red("Failed to install renderer"));
-      console.error(err instanceof Error ? chalk.dim(err.message) : err);
-      return false;
-    }
-  }
-
-  if (commands.contentServer) {
-    const spinner = ora("Checking content server...").start();
-    try {
-      await ensureContentServer(spinner);
-    } catch (err: any) {
-      if (err?.message === "__ABORTED__") return false;
-      spinner.fail(chalk.red("Failed to install content server"));
-      console.error(err instanceof Error ? chalk.dim(err.message) : err);
-      return false;
-    }
-  }
-
-  return true;
-}
 
 program
   .name("viabl")
@@ -554,7 +38,11 @@ program
   .command("init [project-name]")
   .description("Create a new Viabl documentation project")
   .action(async (projectName?: string) => {
-    registerEarlyShutdown();
+    registerEarlyShutdown({
+      earlyAbortController,
+      activeTempDirs,
+      activeSpinner,
+    });
 
     console.log(chalk.bold("\nCreate a new Viabl project\n"));
 
@@ -583,9 +71,15 @@ program
     activeSpinner = spinner;
 
     try {
-      await downloadStarter(projectDir, (msg) => {
-        spinner.text = msg;
+      await downloadStarter({
+        destDir: projectDir,
+        onProgress: (msg) => {
+          spinner.text = msg;
+        },
+        activeTempDirs,
+        earlyAbortController,
       });
+
       spinner.succeed(chalk.dim("Starter template downloaded"));
     } catch (err: any) {
       spinner.fail(chalk.red("Failed to download starter template"));
@@ -631,7 +125,11 @@ program
   .option("-p, --port <port>", "Port to run on", "7777")
   .action(async (options) => {
     const userDir = process.cwd();
-    const earlyShutdownHandler = registerEarlyShutdown();
+    const earlyShutdownHandler = registerEarlyShutdown({
+      earlyAbortController,
+      activeTempDirs,
+      activeSpinner,
+    });
 
     if (!existsSync(join(userDir, "docs.json"))) {
       console.error(chalk.red("\nNo docs.json found in current directory"));
@@ -657,10 +155,10 @@ program
     console.log(chalk.dim(`${userDir}`));
     console.log(chalk.dim(`\n`));
 
-    const ensured = await runEnsureSteps({
-      renderer: true,
-      contentServer: true,
-    });
+    const ensured = await runSteps(
+      { renderer: true, rendererSources: false, contentServer: true },
+      { activeTempDirs, earlyAbortController },
+    );
 
     if (!ensured) process.exit(1);
 
@@ -723,7 +221,7 @@ program
     });
 
     try {
-      await waitForContentServer(contentPort, 20000);
+      await waitForServer(contentPort, 20000);
       contentSpinner.succeed(
         chalk.dim(`Content server running on port ${contentPort}`),
       );
@@ -863,11 +361,18 @@ program
   .command("update")
   .description("Update renderer and content server to latest versions")
   .action(async () => {
-    registerEarlyShutdown();
+    registerEarlyShutdown({
+      earlyAbortController,
+      activeTempDirs,
+      activeSpinner,
+    });
 
     console.log(chalk.bold("\nChecking for updates...\n"));
 
-    await runEnsureSteps({ renderer: true, contentServer: true });
+    await runSteps(
+      { renderer: true, rendererSources: false, contentServer: true },
+      { activeTempDirs, earlyAbortController },
+    );
 
     console.log(chalk.dim("\nDone.\n"));
   });
@@ -951,7 +456,11 @@ program
     const userDir = process.cwd();
     const BUILD_DIR = join(userDir, ".viabl");
 
-    registerEarlyShutdown();
+    registerEarlyShutdown({
+      earlyAbortController,
+      activeTempDirs,
+      activeSpinner,
+    });
 
     if (!existsSync(join(userDir, "docs.json"))) {
       console.error(chalk.red("\n  No docs.json found in current directory"));
@@ -963,13 +472,29 @@ program
 
     console.log(chalk.bold("\n📦  Viabl Build\n"));
 
-    const ensured = await runEnsureSteps({
-      renderer: true,
-      contentServer: true,
-    });
+    // dev uses renderer, build uses rendererSources
+    const ensured = await runSteps(
+      {
+        renderer: false,
+        rendererSources: true,
+        contentServer: true,
+      },
+      { activeTempDirs, earlyAbortController },
+    );
     if (!ensured) process.exit(1);
 
-    const buildSpinner = ora("Assembling build output...").start();
+    // Build renderer with user's basePath
+    const buildSpinner = ora("Building renderer...").start();
+    try {
+      await buildRenderer(userDir, buildSpinner);
+    } catch (err) {
+      buildSpinner.fail(chalk.red("Renderer build failed"));
+      console.error(err instanceof Error ? chalk.dim(err.message) : err);
+      process.exit(1);
+    }
+
+    // Assemble .viabl/ output
+    const assembleSpinner = ora("Assembling build output...").start();
     try {
       if (existsSync(BUILD_DIR))
         rmSync(BUILD_DIR, { recursive: true, force: true });
@@ -996,9 +521,9 @@ program
       }
 
       writeFileSync(join(BUILD_DIR, "start.js"), startScript, { mode: 0o755 });
-      buildSpinner.succeed(chalk.dim("Build output ready"));
+      assembleSpinner.succeed(chalk.dim("Build output ready"));
     } catch (err) {
-      buildSpinner.fail(chalk.red("Build failed"));
+      assembleSpinner.fail(chalk.red("Failed to assemble build"));
       console.error(err instanceof Error ? chalk.dim(err.message) : err);
       process.exit(1);
     }
@@ -1009,7 +534,6 @@ program
     console.log(chalk.dim("    node .viabl/start.js\n"));
     console.log(chalk.dim("    PORT=<YOUR_PORT> node .viabl/start.js\n"));
   });
-
 // Start Command
 
 program
