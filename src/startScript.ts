@@ -19,8 +19,10 @@ try {
   basePath = config.basePath ?? "";
 } catch {}
 
+if (basePath && !basePath.startsWith("/")) {
+  basePath = "/" + basePath;
+}
 
-console.log(basePath)
 
 console.log("\\nViabl");
 console.log("🌐 http://localhost:" + RENDERER_PORT + basePath + "\\n");

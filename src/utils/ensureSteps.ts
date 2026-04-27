@@ -17,7 +17,10 @@ export async function runSteps(
     try {
       await ensureRenderer({ spinner, ...context });
     } catch (err: any) {
-      if (err?.message === "__ABORTED__") return false;
+      if (err?.message === "__ABORTED__") {
+        spinner.stop();
+        return false;
+      }
       spinner.fail(chalk.red("Failed to install renderer"));
       console.error(err instanceof Error ? chalk.dim(err.message) : err);
       return false;

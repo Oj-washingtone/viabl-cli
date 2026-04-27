@@ -49,11 +49,21 @@ export async function ensureRendererSources(
   await new Promise<void>((resolve, reject) => {
     const child = spawn("npm", ["install"], {
       cwd: RENDERER_SRC_DIR,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["ignore", "ignore", "pipe"],
     });
+
+    let stderr = "";
+    child.stderr?.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+
     child.on("error", reject);
     child.on("exit", (code) =>
-      code === 0 ? resolve() : reject(new Error("npm install failed")),
+      code === 0
+        ? resolve()
+        : reject(
+            new Error(`npm install failed (exit code ${code}): ${stderr}`),
+          ),
     );
   });
 

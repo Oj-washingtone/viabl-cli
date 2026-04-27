@@ -47,14 +47,12 @@ export async function ensureContentServer(
 }
 
 export function waitForServer(port: number, timeoutMs = 20000): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const start = Date.now();
+  const start = Date.now();
 
-    let fetchAbort: AbortController | null = null;
-
-    const interval = setInterval(async () => {
-      fetchAbort = new AbortController();
-      const fetchTimeout = setTimeout(() => fetchAbort?.abort(), 2000);
+  const poll = async (): Promise<void> => {
+    while (Date.now() - start < timeoutMs) {
+      const fetchAbort = new AbortController();
+      const fetchTimeout = setTimeout(() => fetchAbort.abort(), 2000);
 
       try {
         const res = await fetch(`http://localhost:${port}/health`, {
@@ -62,16 +60,17 @@ export function waitForServer(port: number, timeoutMs = 20000): Promise<void> {
         });
         clearTimeout(fetchTimeout);
         if (res.ok) {
-          clearInterval(interval);
-          resolve();
+          return;
         }
       } catch {
         clearTimeout(fetchTimeout);
-        if (Date.now() - start > timeoutMs) {
-          clearInterval(interval);
-          reject(new Error("Content server did not start in time"));
-        }
       }
-    }, 300);
-  });
+
+      await new Promise((r) => setTimeout(r, 300));
+    }
+
+    throw new Error("Content server did not start in time");
+  };
+
+  return poll();
 }

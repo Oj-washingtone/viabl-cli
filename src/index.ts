@@ -24,7 +24,7 @@ import { downloadStarter } from "./assets";
 const { version } = require("../package.json");
 
 export const activeTempDirs = new Set<string>();
-export let earlyAbortController: AbortController | null = null;
+export let earlyAbortController: AbortController | null = new AbortController();
 let activeSpinner: Ora | null = null;
 
 program
@@ -369,10 +369,11 @@ program
 
     console.log(chalk.bold("\nChecking for updates...\n"));
 
-    await runSteps(
+    const ensured = await runSteps(
       { renderer: true, rendererSources: false, contentServer: true },
       { activeTempDirs, earlyAbortController },
     );
+    if (!ensured) process.exit(1);
 
     console.log(chalk.dim("\nDone.\n"));
   });
@@ -485,16 +486,20 @@ program
 
     // Build renderer with user's basePath
     const buildSpinner = ora("Building renderer...").start();
+    activeSpinner = buildSpinner;
     try {
       await buildRenderer(userDir, buildSpinner);
     } catch (err) {
       buildSpinner.fail(chalk.red("Renderer build failed"));
       console.error(err instanceof Error ? chalk.dim(err.message) : err);
       process.exit(1);
+    } finally {
+      activeSpinner = null;
     }
 
     // Assemble .viabl/ output
     const assembleSpinner = ora("Assembling build output...").start();
+    activeSpinner = assembleSpinner;
     try {
       if (existsSync(BUILD_DIR))
         rmSync(BUILD_DIR, { recursive: true, force: true });
@@ -526,6 +531,8 @@ program
       assembleSpinner.fail(chalk.red("Failed to assemble build"));
       console.error(err instanceof Error ? chalk.dim(err.message) : err);
       process.exit(1);
+    } finally {
+      activeSpinner = null;
     }
 
     console.log(chalk.green("\n✔  Build complete\n"));

@@ -33,6 +33,7 @@ export async function gitCommit(
           GIT_COMMITTER_EMAIL: "init@viabl.dev",
         },
       });
+      commit.on("error", () => reject(new Error("git not found")));
       commit.on("exit", (c) =>
         c === 0 ? resolve() : reject(new Error("git commit failed")),
       );

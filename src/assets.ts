@@ -146,10 +146,10 @@ export async function downloadAndExtract(
       rmSync(tempDir, { recursive: true, force: true });
     }
   } catch (err: any) {
+    rmSync(tempDir, { recursive: true, force: true });
     if (options.earlyAbortController?.signal.aborted) {
       throw new Error("__ABORTED__");
     }
-    rmSync(tempDir, { recursive: true, force: true });
     throw err;
   } finally {
     options.activeTempDirs.delete(tempDir);
