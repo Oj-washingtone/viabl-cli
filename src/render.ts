@@ -1,7 +1,7 @@
 import chalk from "chalk";
 import { type Ora } from "ora";
 import spawn from "cross-spawn";
-import { existsSync, rmSync } from "fs";
+import { existsSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import { downloadAndExtract, getLatestAsset } from "./assets";
 import { getVersionInfo, saveVersionInfo } from "./version";
@@ -113,11 +113,21 @@ export async function buildRenderer(
   spinner: Ora,
 ): Promise<void> {
   const basePath = getDocsBasePath(userDir);
-  const { lastBuiltBasePath } = getVersionInfo();
+
+  const standaloneDir = join(RENDERER_SRC_DIR, ".next", "standalone");
 
   // Skip rebuild if nothing changed
-  const standaloneDir = join(RENDERER_SRC_DIR, ".next", "standalone");
-  if (lastBuiltBasePath === basePath && existsSync(standaloneDir)) {
+
+  const projectRendererDir = join(userDir, ".viabl", "renderer");
+
+  const metaFile = join(projectRendererDir, ".viabl-meta.json");
+  let lastBuiltBasePath: string | null = null;
+  try {
+    const meta = JSON.parse(readFileSync(metaFile, "utf-8"));
+    lastBuiltBasePath = meta.basePath ?? null;
+  } catch {}
+
+  if (lastBuiltBasePath === basePath && existsSync(projectRendererDir)) {
     spinner.succeed(chalk.dim("Renderer already built for this basePath"));
     return;
   }
@@ -159,13 +169,13 @@ export async function buildRenderer(
     await cp(publicSrc, publicDest, { recursive: true, force: true });
   }
 
-  // Replace cached prebuilt renderer with freshly built one
   spinner.text = "Copying build output...";
-  if (existsSync(RENDERER_DIR)) {
-    rmSync(RENDERER_DIR, { recursive: true, force: true });
-  }
-  await cp(standaloneDir, RENDERER_DIR, { recursive: true, dereference: true });
+  await cp(standaloneDir, projectRendererDir, {
+    recursive: true,
+    dereference: true,
+    force: true,
+  });
 
-  saveVersionInfo({ lastBuiltBasePath: basePath });
-  spinner.succeed(chalk.dim(`Renderer built successfully`));
+  writeFileSync(metaFile, JSON.stringify({ basePath }), "utf-8");
+  spinner.succeed(chalk.dim("Renderer built successfully"));
 }

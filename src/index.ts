@@ -484,6 +484,10 @@ program
     );
     if (!ensured) process.exit(1);
 
+    if (existsSync(BUILD_DIR))
+      rmSync(BUILD_DIR, { recursive: true, force: true });
+    mkdirSync(BUILD_DIR, { recursive: true });
+
     // Build renderer with user's basePath
     const buildSpinner = ora("Building renderer...").start();
     activeSpinner = buildSpinner;
@@ -501,16 +505,10 @@ program
     const assembleSpinner = ora("Assembling build output...").start();
     activeSpinner = assembleSpinner;
     try {
-      if (existsSync(BUILD_DIR))
-        rmSync(BUILD_DIR, { recursive: true, force: true });
       mkdirSync(BUILD_DIR, { recursive: true });
 
       const { cp } = await import("fs/promises");
 
-      await cp(RENDERER_DIR, join(BUILD_DIR, "renderer"), {
-        recursive: true,
-        dereference: true,
-      });
       await cp(CONTENT_SERVER_DIR, join(BUILD_DIR, "content-server"), {
         recursive: true,
         dereference: true,
