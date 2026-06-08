@@ -3,6 +3,7 @@ import { ensureContentServer } from "../server";
 import chalk from "chalk";
 import ora from "ora";
 import { type EnsureOptions } from "../types/assets";
+import { track } from "../telemetry";
 
 export async function runSteps(
   commands: {
@@ -23,6 +24,7 @@ export async function runSteps(
       }
       spinner.fail(chalk.red("Failed to install renderer"));
       console.error(err instanceof Error ? chalk.dim(err.message) : err);
+      track("dev", { success: false, errorType: "download_failed" });
       return false;
     }
   }
@@ -35,6 +37,7 @@ export async function runSteps(
       if (err?.message === "__ABORTED__") return false;
       spinner.fail(chalk.red("Failed to install renderer sources"));
       console.error(err instanceof Error ? chalk.dim(err.message) : err);
+      track("dev", { success: false, errorType: "download_failed" });
       return false;
     }
   }
@@ -47,6 +50,7 @@ export async function runSteps(
       if (err?.message === "__ABORTED__") return false;
       spinner.fail(chalk.red("Failed to install content server"));
       console.error(err instanceof Error ? chalk.dim(err.message) : err);
+      track("dev", { success: false, errorType: "download_failed" });
       return false;
     }
   }

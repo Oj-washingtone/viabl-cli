@@ -20,12 +20,37 @@ import { waitForServer } from "./server";
 import { runSteps } from "./utils/ensureSteps";
 import { buildRenderer } from "./render";
 import { downloadStarter } from "./assets";
+import {
+  initTelemetry,
+  isFirstRun,
+  isTelemetryEnabled,
+  setTelemetryEnabled,
+  track,
+} from "./telemetry";
 
 const { version } = require("../package.json");
 
 export const activeTempDirs = new Set<string>();
 export let earlyAbortController: AbortController | null = new AbortController();
 let activeSpinner: Ora | null = null;
+
+const firstRun = isFirstRun();
+initTelemetry();
+
+if (firstRun) {
+  console.log(
+    chalk.dim(
+      "\n  Viabl collects anonymous usage data to help improve the tool.\n" +
+        "  No personal information is collected.\n" +
+        "  To opt out: " +
+        chalk.white("viabl telemetry disable") +
+        "\n" +
+        "  Learn more: " +
+        chalk.white("https://viabl.dev/telemetry") +
+        "\n",
+    ),
+  );
+}
 
 program
   .name("viabl")
@@ -38,6 +63,7 @@ program
   .command("init [project-name]")
   .description("Create a new Viabl documentation project")
   .action(async (projectName?: string) => {
+    const start = Date.now();
     registerEarlyShutdown({
       earlyAbortController,
       activeTempDirs,
@@ -87,6 +113,7 @@ program
         console.error(err instanceof Error ? chalk.dim(err.message) : err);
       }
       rmSync(projectDir, { recursive: true, force: true });
+      track("init", { success: false, errorType: "download_failed" });
       process.exit(1);
     } finally {
       activeSpinner = null;
@@ -100,6 +127,8 @@ program
     } catch {
       gitSpinner.fail(chalk.dim("Git init skipped — git not found"));
     }
+
+    track("init", { success: true, duration: Date.now() - start });
 
     console.log(chalk.green(`\n✔  Created ${projectName}\n`));
     console.log(chalk.white("  Next steps:\n"));
@@ -118,12 +147,12 @@ program
   });
 
 // Dev Command
-
 program
   .command("dev")
   .description("Start the viabl development server")
   .option("-p, --port <port>", "Port to run on", "7777")
   .action(async (options) => {
+    const start = Date.now();
     const userDir = process.cwd();
     const earlyShutdownHandler = registerEarlyShutdown({
       earlyAbortController,
@@ -227,6 +256,7 @@ program
       );
     } catch {
       contentSpinner.fail(chalk.red("Content server failed to start"));
+      track("dev", { success: false, errorType: "content_server_timeout" });
       contentChild!.kill();
       process.exit(1);
     }
@@ -280,6 +310,7 @@ program
           chalk.green(`Ready at http://localhost:${rendererPort}`),
         );
         console.log(chalk.dim(`\n  Press ${chalk.white("Ctrl+C")} to stop\n`));
+        track("dev", { success: true, duration: Date.now() - start });
         return;
       }
       if (text.includes("Error:") || text.includes("Failed to compile")) {
@@ -375,6 +406,7 @@ program
     );
     if (!ensured) process.exit(1);
 
+    track("update", { success: true });
     console.log(chalk.dim("\nDone.\n"));
   });
 
@@ -407,6 +439,7 @@ program
       spinner.succeed(
         chalk.green("Cache cleared — will re-download on next `viabl dev`"),
       );
+      track("clear_cache", { success: true });
     } catch (err) {
       spinner.fail(chalk.red("Failed to clear cache"));
       console.error(err);
@@ -456,6 +489,7 @@ program
   .action(async () => {
     const userDir = process.cwd();
     const BUILD_DIR = join(userDir, ".viabl");
+    const start = Date.now();
 
     registerEarlyShutdown({
       earlyAbortController,
@@ -495,6 +529,7 @@ program
       await buildRenderer(userDir, buildSpinner);
     } catch (err) {
       buildSpinner.fail(chalk.red("Renderer build failed"));
+      track("build", { success: false, errorType: "failed_render_build" });
       console.error(err instanceof Error ? chalk.dim(err.message) : err);
       process.exit(1);
     } finally {
@@ -525,9 +560,11 @@ program
 
       writeFileSync(join(BUILD_DIR, "start.js"), startScript, { mode: 0o755 });
       assembleSpinner.succeed(chalk.dim("Build output ready"));
+      track("build", { success: true, duration: Date.now() - start });
     } catch (err) {
       assembleSpinner.fail(chalk.red("Failed to assemble build"));
       console.error(err instanceof Error ? chalk.dim(err.message) : err);
+      track("build", { success: false, errorType: "unknown" });
       process.exit(1);
     } finally {
       activeSpinner = null;
@@ -539,8 +576,8 @@ program
     console.log(chalk.dim("    node .viabl/start.js\n"));
     console.log(chalk.dim("    PORT=<YOUR_PORT> node .viabl/start.js\n"));
   });
-// Start Command
 
+// Start Command
 program
   .command("start")
   .description("Run the production build")
@@ -594,6 +631,32 @@ program
 
     process.on("SIGINT", shutdown);
     process.on("SIGTERM", shutdown);
+  });
+
+// telemetry command
+program
+  .command("telemetry <status>")
+  .description("Enable or disable telemetry (enable | disable | status)")
+  .action((status: string) => {
+    if (status === "disable") {
+      setTelemetryEnabled(false);
+      console.log(chalk.dim("\n  Telemetry disabled.\n"));
+    } else if (status === "enable") {
+      setTelemetryEnabled(true);
+      console.log(chalk.dim("\n  Telemetry enabled. Thank you!\n"));
+    } else if (status === "status") {
+      const enabled = isTelemetryEnabled();
+      console.log(
+        chalk.dim(
+          `\n  Telemetry is currently ${enabled ? chalk.green("enabled") : chalk.red("disabled")}.\n`,
+        ),
+      );
+    } else {
+      console.error(
+        chalk.red("\n  Usage: viabl telemetry <enable|disable|status>\n"),
+      );
+      process.exit(1);
+    }
   });
 
 program.parse();
