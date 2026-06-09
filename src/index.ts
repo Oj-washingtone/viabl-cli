@@ -576,7 +576,6 @@ program
     console.log(chalk.dim("    node .viabl/start.js\n"));
     console.log(chalk.dim("    PORT=<YOUR_PORT> node .viabl/start.js\n"));
   });
-
 // Start Command
 program
   .command("start")
