@@ -7,7 +7,7 @@ import { ChildProcess } from "child_process";
 import spawn from "cross-spawn";
 
 import { existsSync, mkdirSync, rmSync, writeFileSync, readdirSync } from "fs";
-import { join } from "path";
+import { join, basename, resolve } from "path";
 import { startScript } from "./startScript";
 import { prompt } from "./utils/prompt";
 import { gitInit, gitCommit } from "./utils/gitHelpers";
@@ -41,13 +41,10 @@ if (firstRun) {
   console.log(
     chalk.dim(
       "\n  Viabl collects anonymous usage data to help improve the tool.\n" +
-        "  No personal information is collected.\n" +
-        "  To opt out: " +
-        chalk.white("viabl telemetry disable") +
-        "\n" +
-        "  Learn more: " +
-        chalk.white("https://viabl.dev/telemetry") +
-        "\n",
+      "  No personal information is collected.\n" +
+      "  To opt out: " +
+      chalk.white("viabl telemetry off") +
+      "\n",
     ),
   );
 }
@@ -79,19 +76,44 @@ program
       if (!projectName) projectName = "my-docs";
     }
 
-    projectName = projectName
-      .toLowerCase()
-      .replace(/\s+/g, "-")
-      .replace(/[^a-z0-9-]/g, "");
+    const isCurrentDir =
+      projectName === "." ||
+      projectName === "./" ||
+      resolve(process.cwd(), projectName) === process.cwd();
 
-    const projectDir = join(process.cwd(), projectName);
+    let projectDir: string;
+    let displayName: string;
 
-    if (existsSync(projectDir)) {
-      console.error(chalk.red(`\nFolder '${projectName}' already exists.\n`));
-      process.exit(1);
+    if (isCurrentDir) {
+      projectDir = process.cwd();
+      displayName = basename(projectDir);
+
+      if (existsSync(join(projectDir, "docs.json"))) {
+        console.error(
+          chalk.red(
+            "\nFolder already contains a Viabl project (docs.json exists).\n",
+          ),
+        );
+        process.exit(1);
+      }
+    } else {
+      let sanitizedName = projectName
+        .toLowerCase()
+        .replace(/\s+/g, "-")
+        .replace(/[^a-z0-9-]/g, "");
+
+      if (!sanitizedName) sanitizedName = "my-docs";
+
+      displayName = sanitizedName;
+      projectDir = join(process.cwd(), displayName);
+
+      if (existsSync(projectDir)) {
+        console.error(chalk.red(`\nFolder '${displayName}' already exists.\n`));
+        process.exit(1);
+      }
+
+      mkdirSync(projectDir, { recursive: true });
     }
-
-    mkdirSync(projectDir, { recursive: true });
 
     const spinner = ora("Fetching starter template...").start();
     activeSpinner = spinner;
@@ -112,7 +134,9 @@ program
       if (err?.message !== "__ABORTED__") {
         console.error(err instanceof Error ? chalk.dim(err.message) : err);
       }
-      rmSync(projectDir, { recursive: true, force: true });
+      if (!isCurrentDir) {
+        rmSync(projectDir, { recursive: true, force: true });
+      }
       track("init", { success: false, errorType: "download_failed" });
       process.exit(1);
     } finally {
@@ -130,9 +154,11 @@ program
 
     track("init", { success: true, duration: Date.now() - start });
 
-    console.log(chalk.green(`\n✔  Created ${projectName}\n`));
+    console.log(chalk.green(`\n✔  Created ${displayName}\n`));
     console.log(chalk.white("  Next steps:\n"));
-    console.log(chalk.dim(`    cd ${projectName}`));
+    if (!isCurrentDir) {
+      console.log(chalk.dim(`    cd ${displayName}`));
+    }
     console.log(chalk.dim("    viabl dev\n"));
     console.log(
       chalk.dim(
@@ -421,8 +447,8 @@ program
       const answer = await prompt(
         chalk.yellow(
           "  This will remove the cached renderer and content server.\n" +
-            "  They will be re-downloaded on next run.\n\n" +
-            "  Continue? (y/N) ",
+          "  They will be re-downloaded on next run.\n\n" +
+          "  Continue? (y/N) ",
         ),
       );
       if (answer.toLowerCase() !== "y") {
