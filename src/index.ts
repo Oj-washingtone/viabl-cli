@@ -381,32 +381,32 @@ program
 
       rendererChild!.stderr?.removeAllListeners("data");
       rendererChild!.stdout?.removeAllListeners("data");
+      contentChild!.stderr?.removeAllListeners("data");
+      contentChild!.stdout?.removeAllListeners("data");
 
-      rendererChild!.kill("SIGTERM");
+      // Signal both children simultaneously for fast parallel termination
+      try { rendererChild!.kill("SIGTERM"); } catch {}
+      try { contentChild!.kill("SIGTERM"); } catch {}
 
-      rendererChild!.once("exit", () => {
-        contentChild!.kill("SIGTERM");
-
-        const done = () => {
+      let exitedCount = 0;
+      const done = () => {
+        exitedCount++;
+        if (exitedCount >= 2) {
           spinner.succeed(chalk.dim("Servers stopped"));
-          setTimeout(() => process.exit(0), 100);
-        };
+          setTimeout(() => process.exit(0), 50);
+        }
+      };
 
-        contentChild!.once("exit", done);
+      rendererChild!.once("exit", done);
+      contentChild!.once("exit", done);
 
-        setTimeout(() => {
-          contentChild!.kill("SIGKILL");
-          done();
-        }, 3000).unref();
-      });
-
-      // Safety net
+      // Force kill after 1 second if processes don't exit cleanly
       setTimeout(() => {
-        rendererChild!.kill("SIGKILL");
-        contentChild!.kill("SIGKILL");
+        try { rendererChild!.kill("SIGKILL"); } catch {}
+        try { contentChild!.kill("SIGKILL"); } catch {}
         spinner.succeed(chalk.dim("Servers stopped"));
-        setTimeout(() => process.exit(0), 100);
-      }, 5000).unref();
+        setTimeout(() => process.exit(0), 50);
+      }, 1000).unref();
     };
 
     process.on("SIGINT", shutdown);

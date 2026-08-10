@@ -67,28 +67,28 @@ rendererChild.on("exit", (code) => {
 });
 
 const shutdown = () => {
+  if (isShuttingDown) return;
   isShuttingDown = true;
 
-  rendererChild.kill("SIGTERM");
+  try { rendererChild.kill("SIGTERM"); } catch {}
+  try { contentChild.kill("SIGTERM"); } catch {}
 
-  rendererChild.once("exit", () => {
-    contentChild.kill("SIGTERM");
-
-    contentChild.once("exit", () => {
+  let exitedCount = 0;
+  const done = () => {
+    exitedCount++;
+    if (exitedCount >= 2) {
       process.exit(0);
-    });
+    }
+  };
 
-    setTimeout(() => {
-      contentChild.kill("SIGKILL");
-      process.exit(0);
-    }, 3000).unref();
-  });
+  rendererChild.once("exit", done);
+  contentChild.once("exit", done);
 
   setTimeout(() => {
-    rendererChild.kill("SIGKILL");
-    contentChild.kill("SIGKILL");
+    try { rendererChild.kill("SIGKILL"); } catch {}
+    try { contentChild.kill("SIGKILL"); } catch {}
     process.exit(0);
-  }, 5000).unref();
+  }, 1000).unref();
 };
 
 process.on("SIGINT",  shutdown);
