@@ -301,6 +301,7 @@ program
           HOSTNAME: "0.0.0.0",
           NEXT_PUBLIC_SITE_URL: `http://localhost:${rendererPort}`,
           CONTENT_SERVER_URL: `http://localhost:${contentPort}`,
+          NODE_ENV: process.env.NODE_ENV ?? "development",
         },
         stdio: ["ignore", "pipe", "pipe"],
       });
