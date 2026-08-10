@@ -46,6 +46,35 @@ function writeReleaseCache(data: ReleaseData, etag?: string): void {
 export async function getLatestAsset(
   assetName: string,
 ): Promise<{ version: string; downloadUrl: string }> {
+  // 1. Primary approach: Query public GitHub release download redirect (bypasses REST API rate limits completely, no token needed)
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10_000);
+    try {
+      const latestDownloadUrl = `https://github.com/${RELEASES_REPO}/releases/latest/download/${assetName}`;
+      const res = await fetch(latestDownloadUrl, {
+        signal: controller.signal,
+        redirect: "manual",
+        headers: {
+          "User-Agent": "viabl-cli/0.1.0",
+        },
+      });
+
+      if (res.status === 302 || res.status === 301) {
+        const location = res.headers.get("location");
+        const tagMatch = location?.match(/\/releases\/download\/([^/]+)\//);
+        if (tagMatch && tagMatch[1]) {
+          const version = tagMatch[1];
+          const downloadUrl = location || latestDownloadUrl;
+          return { version, downloadUrl };
+        }
+      }
+    } finally {
+      clearTimeout(timeout);
+    }
+  } catch {}
+
+  // 2. Fallback approach: GitHub REST API or local release cache
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 15_000);
 
@@ -54,6 +83,11 @@ export async function getLatestAsset(
     Accept: "application/vnd.github.v3+json",
     "User-Agent": "viabl-cli/0.1.0",
   };
+
+  const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
 
   if (cached?.etag) {
     headers["If-None-Match"] = cached.etag;
@@ -79,6 +113,9 @@ export async function getLatestAsset(
       releaseData = (await res.json()) as ReleaseData;
       writeReleaseCache(releaseData, newEtag);
     } else if ((res.status === 403 || res.status === 429) && cached?.data) {
+      console.warn(
+        `\n⚠️ GitHub API rate limit exceeded. Using cached release data (${cached.data.tag_name}).`,
+      );
       releaseData = cached.data;
     } else if (res.status === 404) {
       throw new Error(
@@ -96,6 +133,9 @@ export async function getLatestAsset(
     }
   } catch (err: any) {
     if (cached?.data) {
+      console.warn(
+        `\n⚠️ Failed to fetch latest release from GitHub. Using cached release data (${cached.data.tag_name}).`,
+      );
       releaseData = cached.data;
     } else {
       throw err;
